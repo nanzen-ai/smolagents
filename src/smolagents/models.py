@@ -17,10 +17,11 @@ import os
 import re
 import uuid
 import warnings
-from collections.abc import Generator
+from collections.abc import Callable, Generator, Iterator
 from copy import deepcopy
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import Enum
+from functools import wraps
 from threading import Thread
 from typing import TYPE_CHECKING, Any
 
@@ -89,6 +90,55 @@ def remove_content_after_stop_sequences(content: str | None, stop_sequences: lis
         split = content.split(stop_seq)
         content = split[0]
     return content
+
+
+def cut_stream_at_stop_sequences(
+    stream_deltas: Iterator["ChatMessageStreamDelta"], stop_sequences: list[str] | None
+) -> Generator["ChatMessageStreamDelta"]:
+    """Yield stream deltas until a stop sequence appears in the streamed content, then close the stream.
+
+    Only `content` is matched. A tail of content that could be the start of a stop sequence split
+    across chunks is held back until the next chunk shows whether it is one.
+    """
+    if not stop_sequences:
+        yield from stream_deltas
+        return
+    holdback = max(len(stop_seq) for stop_seq in stop_sequences) - 1
+    buffer = ""
+    try:
+        for delta in stream_deltas:
+            if not delta.content:
+                yield delta
+                continue
+            buffer += delta.content
+            stop_indices = [index for stop_seq in stop_sequences if (index := buffer.find(stop_seq)) != -1]
+            if stop_indices:
+                if content := buffer[: min(stop_indices)]:
+                    yield ChatMessageStreamDelta(content=content)
+                return
+            emit_length = len(buffer) - holdback
+            content, buffer = buffer[:emit_length], buffer[emit_length:]
+            if content or delta.tool_calls or delta.token_usage:
+                yield replace(delta, content=content)
+        if buffer:
+            yield ChatMessageStreamDelta(content=buffer)
+    finally:
+        # Stop consuming the provider stream, so generation is not continued for nothing
+        if close := getattr(stream_deltas, "close", None):
+            close()
+
+
+def apply_client_side_stop(generate_stream: Callable) -> Callable:
+    """Decorate a `generate_stream` method to cut its stream at stop sequences that were not sent to the provider."""
+
+    @wraps(generate_stream)
+    def wrapper(self, messages, stop_sequences: list[str] | None = None, *args, **kwargs):
+        stream_deltas = generate_stream(self, messages, stop_sequences, *args, **kwargs)
+        if stop_sequences is not None and not self._sends_stop_to_provider:
+            stream_deltas = cut_stream_at_stop_sequences(stream_deltas, stop_sequences)
+        yield from stream_deltas
+
+    return wrapper
 
 
 @dataclass
@@ -465,6 +515,12 @@ class Model:
             The key used to extract tool arguments from model responses.
         model_id (`str`, *optional*):
             Identifier for the specific model being used.
+        client_side_stop (`bool`, default `False`):
+            Whether to apply stop sequences in smolagents instead of sending them to the provider.
+            Providers match `stop` against everything the model generates, including the reasoning of
+            reasoning models, which can end generation before any content is written. When enabled,
+            stop sequences are only matched against the returned content: it is trimmed after the fact,
+            and streams are closed as soon as a stop sequence appears.
         **kwargs:
             Additional keyword arguments to forward to the underlying model completion call.
 
@@ -487,6 +543,7 @@ class Model:
         tool_name_key: str = "name",
         tool_arguments_key: str = "arguments",
         model_id: str | None = None,
+        client_side_stop: bool = False,
         **kwargs,
     ):
         self.flatten_messages_as_text = flatten_messages_as_text
@@ -494,10 +551,16 @@ class Model:
         self.tool_arguments_key = tool_arguments_key
         self.kwargs = kwargs
         self.model_id: str | None = model_id
+        self.client_side_stop = client_side_stop
 
     @property
     def supports_stop_parameter(self) -> bool:
         return supports_stop_parameter(self.model_id or "")
+
+    @property
+    def _sends_stop_to_provider(self) -> bool:
+        """Whether stop sequences are sent to the provider, rather than applied by smolagents to the content."""
+        return self.supports_stop_parameter and not self.client_side_stop
 
     def _prepare_completion_kwargs(
         self,
@@ -531,8 +594,8 @@ class Model:
             "messages": messages_as_dicts,
         }
         # Override with specific parameters
-        if stop_sequences is not None and self.supports_stop_parameter:
-            # Some models do not support stop parameter
+        if stop_sequences is not None and self._sends_stop_to_provider:
+            # Some models do not support stop parameter, and client_side_stop opts out of sending it
             completion_kwargs["stop"] = stop_sequences
         if response_format is not None:
             completion_kwargs["response_format"] = response_format
@@ -616,6 +679,8 @@ class Model:
         ]:
             if hasattr(self, attribute):
                 model_dictionary[attribute] = getattr(self, attribute)
+        if self.client_side_stop:
+            model_dictionary["client_side_stop"] = True
 
         dangerous_attributes = ["token", "api_key"]
         for attribute_name in dangerous_attributes:
@@ -735,7 +800,7 @@ class VLLMModel(Model):
         )
 
         output_text = out[0].outputs[0].text
-        if stop_sequences is not None and not self.supports_stop_parameter:
+        if stop_sequences is not None and not self._sends_stop_to_provider:
             output_text = remove_content_after_stop_sequences(output_text, stop_sequences)
         return ChatMessage(
             role=MessageRole.ASSISTANT,
@@ -844,7 +909,7 @@ class MLXModel(Model):
             if any((stop_index := text.rfind(stop)) != -1 for stop in stops):
                 text = text[:stop_index]
                 break
-        if stop_sequences is not None and not self.supports_stop_parameter:
+        if stop_sequences is not None and not self._sends_stop_to_provider:
             text = remove_content_after_stop_sequences(text, stop_sequences)
         return ChatMessage(
             role=MessageRole.ASSISTANT,
@@ -1293,7 +1358,7 @@ class LiteLLMModel(ApiModel):
                 f"Response details: {response.model_dump()}"
             )
         content = response.choices[0].message.content
-        if stop_sequences is not None and not self.supports_stop_parameter:
+        if stop_sequences is not None and not self._sends_stop_to_provider:
             content = remove_content_after_stop_sequences(content, stop_sequences)
         return ChatMessage(
             role=response.choices[0].message.role,
@@ -1306,6 +1371,7 @@ class LiteLLMModel(ApiModel):
             ),
         )
 
+    @apply_client_side_stop
     def generate_stream(
         self,
         messages: list[ChatMessage | dict],
@@ -1575,7 +1641,7 @@ class InferenceClientModel(ApiModel):
         self._apply_rate_limit()
         response = self.retryer(self.client.chat_completion, **completion_kwargs)
         content = response.choices[0].message.content
-        if stop_sequences is not None and not self.supports_stop_parameter:
+        if stop_sequences is not None and not self._sends_stop_to_provider:
             content = remove_content_after_stop_sequences(content, stop_sequences)
         return ChatMessage(
             role=response.choices[0].message.role,
@@ -1588,6 +1654,7 @@ class InferenceClientModel(ApiModel):
             ),
         )
 
+    @apply_client_side_stop
     def generate_stream(
         self,
         messages: list[ChatMessage | dict],
@@ -1704,6 +1771,7 @@ class OpenAIModel(ApiModel):
 
         return openai.OpenAI(**self.client_kwargs)
 
+    @apply_client_side_stop
     def generate_stream(
         self,
         messages: list[ChatMessage | dict],
@@ -1779,7 +1847,7 @@ class OpenAIModel(ApiModel):
         self._apply_rate_limit()
         response = self.retryer(self.client.chat.completions.create, **completion_kwargs)
         content = response.choices[0].message.content
-        if stop_sequences is not None and not self.supports_stop_parameter:
+        if stop_sequences is not None and not self._sends_stop_to_provider:
             content = remove_content_after_stop_sequences(content, stop_sequences)
         return ChatMessage(
             role=response.choices[0].message.role,
@@ -2046,7 +2114,7 @@ class AmazonBedrockModel(ApiModel):
             raise KeyError("No message content blocks with 'text' key found in response")
         # Keep the last one
         content = message_content_blocks_with_text[-1]["text"]
-        if stop_sequences is not None and not self.supports_stop_parameter:
+        if stop_sequences is not None and not self._sends_stop_to_provider:
             content = remove_content_after_stop_sequences(content, stop_sequences)
         return ChatMessage(
             role=response["output"]["message"]["role"],

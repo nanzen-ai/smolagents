@@ -15,6 +15,7 @@
 import json
 import sys
 from contextlib import ExitStack
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -25,6 +26,7 @@ from smolagents.models import (
     AmazonBedrockModel,
     AzureOpenAIModel,
     ChatMessage,
+    ChatMessageStreamDelta,
     ChatMessageToolCall,
     InferenceClientModel,
     LiteLLMModel,
@@ -34,6 +36,7 @@ from smolagents.models import (
     Model,
     OpenAIModel,
     TransformersModel,
+    cut_stream_at_stop_sequences,
     get_clean_message_list,
     get_tool_call_from_text,
     get_tool_json_schema,
@@ -41,6 +44,7 @@ from smolagents.models import (
     remove_content_after_stop_sequences,
     supports_stop_parameter,
 )
+from smolagents.monitoring import TokenUsage
 from smolagents.tools import tool
 
 from .utils.markers import require_run_all
@@ -482,6 +486,82 @@ class TestLiteLLMModel:
         model = LiteLLMModel(model_id="fal/llama-3.3-70b", flatten_messages_as_text=True)
         assert model.flatten_messages_as_text
 
+    @staticmethod
+    def _mock_completion_response(content: str, reasoning_content: str | None = None) -> MagicMock:
+        response = MagicMock()
+        response.choices = [MagicMock()]
+        response.choices[0].message.role = "assistant"
+        response.choices[0].message.content = content
+        response.choices[0].message.reasoning_content = reasoning_content
+        response.choices[0].message.tool_calls = None
+        response.usage.prompt_tokens = 10
+        response.usage.completion_tokens = 20
+        return response
+
+    @staticmethod
+    def _mock_stream_events(chunks: list[str]) -> list[SimpleNamespace]:
+        return [
+            SimpleNamespace(
+                usage=None,
+                choices=[SimpleNamespace(delta=SimpleNamespace(content=chunk, tool_calls=None), finish_reason=None)],
+            )
+            for chunk in chunks
+        ]
+
+    def test_stop_sequences_sent_to_provider_by_default(self):
+        with patch("smolagents.models.LiteLLMModel.create_client", return_value=MagicMock()):
+            model = LiteLLMModel(model_id="fireworks_ai/deepseek-v3")
+        model.client.completion.return_value = self._mock_completion_response("<code>x = 1")
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello"}])]
+
+        model.generate(messages, stop_sequences=["</code>"])
+
+        assert model.client.completion.call_args.kwargs["stop"] == ["</code>"]
+
+    def test_client_side_stop_trims_content_without_sending_stop(self):
+        with patch("smolagents.models.LiteLLMModel.create_client", return_value=MagicMock()):
+            model = LiteLLMModel(model_id="fireworks_ai/deepseek-v3", client_side_stop=True)
+        model.client.completion.return_value = self._mock_completion_response(
+            "Thought: sum it <code>x = 1</code> Observation: invented",
+            reasoning_content="draft <code>x = 2</code> then decide",
+        )
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello"}])]
+
+        result = model.generate(messages, stop_sequences=["</code>", "Observation:"])
+
+        assert "stop" not in model.client.completion.call_args.kwargs
+        assert result.content == "Thought: sum it <code>x = 1"
+
+    def test_client_side_stop_cuts_stream_without_sending_stop(self):
+        with patch("smolagents.models.LiteLLMModel.create_client", return_value=MagicMock()):
+            model = LiteLLMModel(model_id="fireworks_ai/deepseek-v3", client_side_stop=True)
+        model.client.completion.return_value = iter(
+            self._mock_stream_events(["Thought: <code>x = 1</co", "de> Observation:", " invented"])
+        )
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello"}])]
+
+        deltas = list(model.generate_stream(messages, stop_sequences=["</code>", "Observation:"]))
+
+        assert "stop" not in model.client.completion.call_args.kwargs
+        assert "".join(delta.content or "" for delta in deltas) == "Thought: <code>x = 1"
+
+    def test_generate_ignores_reasoning_content(self):
+        with patch("smolagents.models.LiteLLMModel.create_client", return_value=MagicMock()):
+            model = LiteLLMModel(model_id="fireworks_ai/deepseek-v3")
+        model.client.completion.return_value = self._mock_completion_response(
+            "<code>x = 1</code>", reasoning_content="draft <code>x = 2</code>"
+        )
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello"}])]
+
+        assert model.generate(messages).content == "<code>x = 1</code>"
+
+    def test_client_side_stop_survives_serialization(self):
+        with patch("smolagents.models.LiteLLMModel.create_client", return_value=MagicMock()):
+            model = LiteLLMModel(model_id="fireworks_ai/deepseek-v3", client_side_stop=True)
+            assert model.to_dict()["client_side_stop"] is True
+            assert LiteLLMModel.from_dict(model.to_dict()).client_side_stop is True
+            assert "client_side_stop" not in LiteLLMModel(model_id="fireworks_ai/deepseek-v3").to_dict()
+
 
 class TestLiteLLMRouterModel:
     @pytest.mark.parametrize(
@@ -753,6 +833,55 @@ def test_remove_content_after_stop_sequences_handles_none():
     # Test with None content
     removed_content = remove_content_after_stop_sequences(None, ["<code>"])
     assert removed_content is None
+
+
+def _stream_contents(chunks: list[str | None]) -> list[ChatMessageStreamDelta]:
+    return [ChatMessageStreamDelta(content=chunk) for chunk in chunks]
+
+
+@pytest.mark.parametrize(
+    "chunks, stop_sequences, expected_content",
+    [
+        (["Hello <code>x = 1</code> ignored"], ["</code>"], "Hello <code>x = 1"),
+        (["<code>x = 1</co", "de> ignored"], ["</code>"], "<code>x = 1"),
+        (["<code>x = 1</c", "o", "d", "e>", " ignored"], ["</code>"], "<code>x = 1"),
+        (["a Observation: b </code> c"], ["</code>", "Observation:"], "a "),
+        (["<code>x = 1</cod", "e = 2"], ["</code>"], "<code>x = 1</code = 2"),
+        (["no stop here"], ["</code>"], "no stop here"),
+        (["</code> right away"], ["</code>"], ""),
+        (["kept as is"], None, "kept as is"),
+        (["kept as is"], [], "kept as is"),
+    ],
+)
+def test_cut_stream_at_stop_sequences(chunks, stop_sequences, expected_content):
+    deltas = list(cut_stream_at_stop_sequences(iter(_stream_contents(chunks)), stop_sequences))
+    assert "".join(delta.content or "" for delta in deltas) == expected_content
+
+
+def test_cut_stream_at_stop_sequences_passes_through_non_content_deltas():
+    tool_call_delta = ChatMessageStreamDelta(content=None, tool_calls=[MagicMock()])
+    usage_delta = ChatMessageStreamDelta(content="", token_usage=TokenUsage(input_tokens=1, output_tokens=2))
+    deltas = list(
+        cut_stream_at_stop_sequences(iter([tool_call_delta, usage_delta, *_stream_contents(["done"])]), ["</code>"])
+    )
+    assert deltas[:2] == [tool_call_delta, usage_delta]
+    assert "".join(delta.content or "" for delta in deltas) == "done"
+
+
+def test_cut_stream_at_stop_sequences_closes_upstream_after_stop():
+    consumed = []
+
+    def provider_stream():
+        for chunk in ["<code>x = 1</code>", " hallucinated Observation:", " more"]:
+            consumed.append(chunk)
+            yield ChatMessageStreamDelta(content=chunk)
+
+    upstream = provider_stream()
+    deltas = list(cut_stream_at_stop_sequences(upstream, ["</code>"]))
+    assert "".join(delta.content for delta in deltas) == "<code>x = 1"
+    assert consumed == ["<code>x = 1</code>"]
+    with pytest.raises(StopIteration):
+        next(upstream)
 
 
 @pytest.mark.parametrize(
