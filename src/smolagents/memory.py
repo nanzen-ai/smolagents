@@ -93,7 +93,11 @@ class ActionStep(MemoryStep):
         messages = []
         if self.model_output is not None and not summary_mode:
             messages.append(
-                ChatMessage(role=MessageRole.ASSISTANT, content=[{"type": "text", "text": self.model_output.strip()}])
+                ChatMessage(
+                    role=MessageRole.ASSISTANT,
+                    content=[{"type": "text", "text": self.model_output.strip()}],
+                    reasoning_content=getattr(self.model_output_message, "reasoning_content", None),
+                )
             )
 
         if self.tool_calls is not None:
