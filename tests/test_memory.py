@@ -174,6 +174,30 @@ def test_action_step_to_messages_replays_the_reasoning_of_its_model_output():
     assert action_step.to_messages()[0].reasoning_content == "why"
 
 
+def test_action_step_to_messages_replays_the_reasoning_on_the_tool_call_when_there_is_no_text():
+    action_step = ActionStep(
+        timing=Timing(start_time=0.0, end_time=1.0),
+        step_number=1,
+        model_output_message=ChatMessage(role=MessageRole.ASSISTANT, content=None, reasoning_content="why"),
+        model_output=None,
+        tool_calls=[ToolCall(id="id", name="get_weather", arguments={"location": "Paris"})],
+    )
+    messages = action_step.to_messages()
+    assert messages[0].role == MessageRole.TOOL_CALL
+    assert messages[0].reasoning_content == "why"
+
+
+def test_action_step_to_messages_replays_the_reasoning_once_when_text_and_tool_call_both_exist():
+    action_step = ActionStep(
+        timing=Timing(start_time=0.0, end_time=1.0),
+        step_number=1,
+        model_output_message=ChatMessage(role=MessageRole.ASSISTANT, content="Hi", reasoning_content="why"),
+        model_output="Hi",
+        tool_calls=[ToolCall(id="id", name="get_weather", arguments={"location": "Paris"})],
+    )
+    assert [m.reasoning_content for m in action_step.to_messages()[:2]] == ["why", None]
+
+
 def test_action_step_to_messages_no_tool_calls_with_observations():
     action_step = ActionStep(
         model_input_messages=None,
