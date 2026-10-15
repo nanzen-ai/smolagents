@@ -175,6 +175,7 @@ class ChatMessage:
     role: MessageRole
     content: str | list[dict[str, Any]] | None = None
     tool_calls: list[ChatMessageToolCall] | None = None
+    reasoning_content: str | None = None  # A reasoning model's thinking, returned apart from the reply
     raw: Any | None = None  # Stores the raw output from the API
     token_usage: TokenUsage | None = None
 
@@ -200,6 +201,7 @@ class ChatMessage:
             role=MessageRole(data["role"]),
             content=data.get("content"),
             tool_calls=data.get("tool_calls"),
+            reasoning_content=data.get("reasoning_content"),
             raw=raw,
             token_usage=token_usage,
         )
@@ -384,6 +386,7 @@ def get_clean_message_list(
     role_conversions: dict[MessageRole, MessageRole] | dict[str, str] = {},
     convert_images_to_image_urls: bool = False,
     flatten_messages_as_text: bool = False,
+    replay_reasoning: bool = False,
 ) -> list[dict[str, Any]]:
     """
     Creates a list of messages to give as input to the LLM. These messages are dictionaries and chat template compatible with transformers LLM chat template.
@@ -394,6 +397,9 @@ def get_clean_message_list(
         role_conversions (`dict[MessageRole, MessageRole]`, *optional* ): Mapping to convert roles.
         convert_images_to_image_urls (`bool`, default `False`): Whether to convert images to image URLs.
         flatten_messages_as_text (`bool`, default `False`): Whether to flatten messages as text.
+        replay_reasoning (`bool`, default `False`): Whether an assistant message keeps its `reasoning_content`.
+            A model that thinks in the open needs its thinking passed back within a tool-call round, or it
+            redoes it on every step; providers whose models never return it may reject the field.
     """
     output_message_list: list[dict[str, Any]] = []
     message_list = deepcopy(message_list)  # Avoid modifying the original list
@@ -444,6 +450,8 @@ def get_clean_message_list(
                     "content": content,
                 }
             )
+            if replay_reasoning and message.reasoning_content:
+                output_message_list[-1]["reasoning_content"] = message.reasoning_content
     return output_message_list
 
 
@@ -521,6 +529,11 @@ class Model:
             reasoning models, which can end generation before any content is written. When enabled,
             stop sequences are only matched against the returned content: it is trimmed after the fact,
             and streams are closed as soon as a stop sequence appears.
+        replay_reasoning (`bool`, default `False`):
+            Whether assistant messages carry their `reasoning_content` back to the provider. A reasoning
+            model that returns its thinking in the open (DeepSeek) expects it back within a tool-call round;
+            without it, the model starts every step from scratch. Leave off for providers whose models
+            never return the field.
         **kwargs:
             Additional keyword arguments to forward to the underlying model completion call.
 
@@ -544,6 +557,7 @@ class Model:
         tool_arguments_key: str = "arguments",
         model_id: str | None = None,
         client_side_stop: bool = False,
+        replay_reasoning: bool = False,
         **kwargs,
     ):
         self.flatten_messages_as_text = flatten_messages_as_text
@@ -552,6 +566,7 @@ class Model:
         self.kwargs = kwargs
         self.model_id: str | None = model_id
         self.client_side_stop = client_side_stop
+        self.replay_reasoning = replay_reasoning
 
     @property
     def supports_stop_parameter(self) -> bool:
@@ -588,6 +603,7 @@ class Model:
             role_conversions=custom_role_conversions or tool_role_conversions,
             convert_images_to_image_urls=convert_images_to_image_urls,
             flatten_messages_as_text=flatten_messages_as_text,
+            replay_reasoning=self.replay_reasoning,
         )
         # Start with messages
         completion_kwargs = {
@@ -1357,13 +1373,15 @@ class LiteLLMModel(ApiModel):
                 " This may indicate a possible API or upstream issue. "
                 f"Response details: {response.model_dump()}"
             )
-        content = response.choices[0].message.content
+        message = response.choices[0].message
+        content = message.content
         if stop_sequences is not None and not self._sends_stop_to_provider:
             content = remove_content_after_stop_sequences(content, stop_sequences)
         return ChatMessage(
-            role=response.choices[0].message.role,
+            role=message.role,
             content=content,
-            tool_calls=response.choices[0].message.tool_calls,
+            tool_calls=message.tool_calls,
+            reasoning_content=getattr(message, "reasoning_content", None),
             raw=response,
             token_usage=TokenUsage(
                 input_tokens=response.usage.prompt_tokens,
@@ -1640,13 +1658,15 @@ class InferenceClientModel(ApiModel):
         )
         self._apply_rate_limit()
         response = self.retryer(self.client.chat_completion, **completion_kwargs)
-        content = response.choices[0].message.content
+        message = response.choices[0].message
+        content = message.content
         if stop_sequences is not None and not self._sends_stop_to_provider:
             content = remove_content_after_stop_sequences(content, stop_sequences)
         return ChatMessage(
-            role=response.choices[0].message.role,
+            role=message.role,
             content=content,
-            tool_calls=response.choices[0].message.tool_calls,
+            tool_calls=message.tool_calls,
+            reasoning_content=getattr(message, "reasoning_content", None),
             raw=response,
             token_usage=TokenUsage(
                 input_tokens=response.usage.prompt_tokens,
@@ -1846,13 +1866,15 @@ class OpenAIModel(ApiModel):
         )
         self._apply_rate_limit()
         response = self.retryer(self.client.chat.completions.create, **completion_kwargs)
-        content = response.choices[0].message.content
+        message = response.choices[0].message
+        content = message.content
         if stop_sequences is not None and not self._sends_stop_to_provider:
             content = remove_content_after_stop_sequences(content, stop_sequences)
         return ChatMessage(
-            role=response.choices[0].message.role,
+            role=message.role,
             content=content,
-            tool_calls=response.choices[0].message.tool_calls,
+            tool_calls=message.tool_calls,
+            reasoning_content=getattr(message, "reasoning_content", None),
             raw=response,
             token_usage=TokenUsage(
                 input_tokens=response.usage.prompt_tokens,

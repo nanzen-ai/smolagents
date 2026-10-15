@@ -555,6 +555,33 @@ class TestLiteLLMModel:
 
         assert model.generate(messages).content == "<code>x = 1</code>"
 
+    def test_generate_keeps_reasoning_content_apart_from_content(self):
+        with patch("smolagents.models.LiteLLMModel.create_client", return_value=MagicMock()):
+            model = LiteLLMModel(model_id="fireworks_ai/deepseek-v3")
+        model.client.completion.return_value = self._mock_completion_response(
+            "<code>x = 1</code>", reasoning_content="draft <code>x = 2</code>"
+        )
+        messages = [ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello"}])]
+
+        result = model.generate(messages)
+
+        assert result.content == "<code>x = 1</code>"
+        assert result.reasoning_content == "draft <code>x = 2</code>"
+
+    def test_replay_reasoning_sends_it_back_on_assistant_messages(self):
+        history = [
+            ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Hello"}]),
+            ChatMessage(role=MessageRole.ASSISTANT, content=[{"type": "text", "text": ""}], reasoning_content="why"),
+            ChatMessage(role=MessageRole.USER, content=[{"type": "text", "text": "Go on"}]),
+        ]
+        with patch("smolagents.models.LiteLLMModel.create_client", return_value=MagicMock()):
+            off = LiteLLMModel(model_id="fireworks_ai/deepseek-v3")
+            on = LiteLLMModel(model_id="fireworks_ai/deepseek-v3", replay_reasoning=True)
+
+        assert "reasoning_content" not in off._prepare_completion_kwargs(history)["messages"][1]
+        assert on._prepare_completion_kwargs(history)["messages"][1]["reasoning_content"] == "why"
+        assert "reasoning_content" not in on._prepare_completion_kwargs(history)["messages"][2]
+
     def test_client_side_stop_survives_serialization(self):
         with patch("smolagents.models.LiteLLMModel.create_client", return_value=MagicMock()):
             model = LiteLLMModel(model_id="fireworks_ai/deepseek-v3", client_side_stop=True)

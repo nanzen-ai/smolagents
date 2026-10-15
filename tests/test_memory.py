@@ -69,7 +69,14 @@ def test_action_step_dict():
     # Check each key individually for better test failure messages
     assert "model_input_messages" in action_step_dict
     assert action_step_dict["model_input_messages"] == [
-        {"role": MessageRole.USER, "content": "Hello", "tool_calls": None, "raw": None, "token_usage": None}
+        {
+            "role": MessageRole.USER,
+            "content": "Hello",
+            "tool_calls": None,
+            "reasoning_content": None,
+            "raw": None,
+            "token_usage": None,
+        }
     ]
 
     assert "tool_calls" in action_step_dict
@@ -100,6 +107,7 @@ def test_action_step_dict():
         "role": "assistant",
         "content": "Hi",
         "tool_calls": None,
+        "reasoning_content": None,
         "raw": None,
         "token_usage": None,
     }
@@ -154,6 +162,16 @@ def test_action_step_to_messages():
     observation_message = messages[3]
     assert observation_message.role == MessageRole.TOOL_RESPONSE
     assert "Observation:\nThis is a nice observation" in observation_message.content[0]["text"]
+
+
+def test_action_step_to_messages_replays_the_reasoning_of_its_model_output():
+    action_step = ActionStep(
+        timing=Timing(start_time=0.0, end_time=1.0),
+        step_number=1,
+        model_output_message=ChatMessage(role=MessageRole.ASSISTANT, content="", reasoning_content="why"),
+        model_output="",
+    )
+    assert action_step.to_messages()[0].reasoning_content == "why"
 
 
 def test_action_step_to_messages_no_tool_calls_with_observations():
