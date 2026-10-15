@@ -91,14 +91,18 @@ class ActionStep(MemoryStep):
 
     def to_messages(self, summary_mode: bool = False) -> list[ChatMessage]:
         messages = []
+        # The reasoning rides on the first assistant turn the step replays: the text when there is
+        # one, else the tool call (a reply that is only a tool call has no text).
+        reasoning_content = getattr(self.model_output_message, "reasoning_content", None)
         if self.model_output is not None and not summary_mode:
             messages.append(
                 ChatMessage(
                     role=MessageRole.ASSISTANT,
                     content=[{"type": "text", "text": self.model_output.strip()}],
-                    reasoning_content=getattr(self.model_output_message, "reasoning_content", None),
+                    reasoning_content=reasoning_content,
                 )
             )
+            reasoning_content = None
 
         if self.tool_calls is not None:
             messages.append(
@@ -110,6 +114,7 @@ class ActionStep(MemoryStep):
                             "text": "Calling tools:\n" + str([tc.dict() for tc in self.tool_calls]),
                         }
                     ],
+                    reasoning_content=reasoning_content,
                 )
             )
 
